@@ -14,10 +14,16 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_THRESHOLD = 0.75
 
+# Set by warmup.load_resemblyzer() before Gradio starts.
+_encoder_cache = None
+
 
 # ── Embedding utilities ───────────────────────────────────────────────────────
 
 def _get_encoder():
+    """Return the cached encoder (set by warmup) or load a new one."""
+    if _encoder_cache is not None:
+        return _encoder_cache
     from resemblyzer import VoiceEncoder
     return VoiceEncoder()
 

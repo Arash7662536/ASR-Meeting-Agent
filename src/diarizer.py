@@ -11,6 +11,10 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Set by warmup.load_pyannote() before Gradio starts.
+# run_diarization() uses this instead of loading on first call.
+_pipeline_cache = None
+
 
 @dataclass
 class Segment:
@@ -87,28 +91,32 @@ def run_diarization(
     import torch
     from pyannote.audio import Pipeline
 
-    token = hf_token or os.environ.get("HF_TOKEN", "")
-    if not token:
-        raise ValueError(
-            "Hugging Face token required for diarization.\n"
-            "Set HF_TOKEN env var or provide it in the UI."
-        )
-
     audio_path = Path(audio_path)
-    logger.info("Loading pyannote/speaker-diarization-3.1 ...")
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1", token=token
-    )
 
-    device = "cpu"
-    try:
-        if torch.cuda.is_available():
-            torch.zeros(1).cuda()
-            pipeline.to(torch.device("cuda"))
-            device = "cuda"
-    except RuntimeError:
-        logger.warning("CUDA not available, falling back to CPU.")
-    logger.info(f"Diarization device: {device.upper()}")
+    # Use pre-warmed pipeline if available (set by warmup.load_pyannote)
+    if _pipeline_cache is not None:
+        pipeline = _pipeline_cache
+        logger.info("Using pre-loaded pyannote pipeline.")
+    else:
+        token = hf_token or os.environ.get("HF_TOKEN", "")
+        if not token:
+            raise ValueError(
+                "Hugging Face token required for diarization.\n"
+                "Set HF_TOKEN env var or provide it in the UI."
+            )
+        logger.info("Loading pyannote/speaker-diarization-3.1 (not pre-warmed) ...")
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1", token=token
+        )
+        device = "cpu"
+        try:
+            if torch.cuda.is_available():
+                torch.zeros(1).cuda()
+                pipeline.to(torch.device("cuda"))
+                device = "cuda"
+        except RuntimeError:
+            logger.warning("CUDA not available, falling back to CPU.")
+        logger.info(f"Diarization device: {device.upper()}")
 
     audio_input = _load_audio(audio_path)
 

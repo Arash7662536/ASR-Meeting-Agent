@@ -3,18 +3,19 @@ Gradio UI — Meeting Transcription App
 
 Tabs
 ----
-1. Process     — Upload file, configure, run pipeline
-2. Results     — View transcript, edit speaker names (persisted to DB)
+1. Process       — Upload file OR paste URL, configure, run pipeline
+2. Results       — View transcript, edit speaker names (persisted to DB)
 3. Voice Library — Manage global named speaker profiles (optional)
-4. History     — Browse past sessions
+4. History       — Browse past sessions
 """
 
 import shutil
-import time
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
+import requests
 
 from config import cfg
 from database import Database
@@ -22,7 +23,6 @@ from pipeline import get_db, run_pipeline
 from speaker_id import compute_embedding
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
 
 def _db() -> Database:
     return get_db()
@@ -39,41 +39,157 @@ def _dur(seconds: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-# ── Tab 1: Process ────────────────────────────────────────────────────────────
+# ── URL download ──────────────────────────────────────────────────────────────
+
+_SUPPORTED_EXTENSIONS = {
+    ".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".ts",
+    ".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac",
+}
+
+_SUPPORTED_MIMETYPES = {
+    "audio/mpeg", "audio/mp3", "audio/wav", "audio/x-wav",
+    "audio/flac", "audio/ogg", "audio/mp4", "audio/aac",
+    "audio/x-m4a", "audio/webm",
+    "video/mp4", "video/x-matroska", "video/webm",
+    "video/quicktime", "video/x-msvideo", "video/mpeg",
+    "application/octet-stream",  # many servers send this for any binary
+}
+
+
+def download_from_url(url: str) -> tuple[str | None, str]:
+    """
+    Download audio/video from a URL.
+
+    Returns:
+        (file_path, status_message)
+        file_path is None on failure.
+    """
+    url = (url or "").strip()
+    if not url:
+        return None, "Please enter a URL."
+
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return None, "URL must start with http:// or https://"
+
+    max_bytes = int(cfg.max_download_size_gb * 1024 ** 3)
+
+    # ── HEAD — check content-type & size without downloading ──────────────────
+    try:
+        head = requests.head(url, timeout=15, allow_redirects=True)
+        content_type = head.headers.get("content-type", "").split(";")[0].strip().lower()
+        content_length = int(head.headers.get("content-length", 0) or 0)
+
+        if content_length and content_length > max_bytes:
+            gb = content_length / 1024 ** 3
+            return None, f"File too large ({gb:.1f} GB). Maximum is {cfg.max_download_size_gb:.0f} GB."
+
+        path_ext = Path(parsed.path).suffix.lower()
+
+        # Reject clearly wrong content types (skip check for octet-stream — let extension decide)
+        if content_type and content_type not in _SUPPORTED_MIMETYPES:
+            if path_ext not in _SUPPORTED_EXTENSIONS:
+                return None, (
+                    f"URL does not appear to point to an audio or video file.\n"
+                    f"  Content-Type: {content_type}\n"
+                    f"  URL path: {parsed.path}\n"
+                    f"  Supported formats: mp4, mkv, wav, mp3, flac, ogg, m4a, …"
+                )
+    except requests.exceptions.Timeout:
+        return None, "HEAD request timed out (15s). The URL may be slow or unreachable."
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Cannot connect to URL: {e}"
+    except Exception:
+        pass  # HEAD may not be supported; proceed to GET
+
+    # ── GET — stream download ─────────────────────────────────────────────────
+    download_dir = cfg.output_dir / "downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+
+    path_ext = Path(parsed.path).suffix.lower()
+    suffix = path_ext if path_ext in _SUPPORTED_EXTENSIONS else ".mp4"
+
+    # Use the filename from URL if available
+    url_filename = Path(parsed.path).name
+    if not url_filename or "." not in url_filename:
+        url_filename = "download" + suffix
+    save_path = download_dir / url_filename
+
+    try:
+        with requests.get(url, stream=True, timeout=cfg.download_timeout_s, allow_redirects=True) as r:
+            r.raise_for_status()
+
+            # Re-check content-type from GET response
+            content_type = r.headers.get("content-type", "").split(";")[0].strip().lower()
+            if content_type and content_type not in _SUPPORTED_MIMETYPES:
+                path_ext = Path(parsed.path).suffix.lower()
+                if path_ext not in _SUPPORTED_EXTENSIONS:
+                    return None, (
+                        f"Server returned unsupported content-type: '{content_type}'.\n"
+                        f"  Expected audio/* or video/*."
+                    )
+
+            downloaded = 0
+            with open(save_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):  # 2 MB chunks
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if downloaded > max_bytes:
+                        save_path.unlink(missing_ok=True)
+                        return None, (
+                            f"Download aborted: file exceeded {cfg.max_download_size_gb:.0f} GB limit."
+                        )
+
+        size_mb = downloaded / (1024 * 1024)
+        return str(save_path), f"Downloaded {size_mb:.1f} MB  →  {url_filename}"
+
+    except requests.exceptions.HTTPError as e:
+        return None, f"HTTP error: {e.response.status_code} {e.response.reason}"
+    except requests.exceptions.Timeout:
+        return None, f"Download timed out after {cfg.download_timeout_s}s."
+    except requests.exceptions.RequestException as e:
+        return None, f"Network error: {e}"
+    except Exception as e:
+        return None, f"Download failed: {e}"
+
+
+# ── Tab 1: Process ─────────────────────────────────────────────────────────────
 
 def process_meeting(
+    # Input
     input_file,
+    url_file_path,        # gr.State — path of URL-downloaded file
+    # Transcription
     language,
-    whisper_model,
+    # Denoising
     skip_demucs,
     demucs_model,
+    # Diarization
+    hf_token,
     num_speakers_raw,
     min_speakers_raw,
     max_speakers_raw,
-    hf_token,
+    # Speaker identification
     use_voice_library,
     similarity_threshold,
     progress=gr.Progress(track_tqdm=True),
 ):
-    if input_file is None:
-        raise gr.Error("Please upload a video or audio file.")
+    # Resolve the input — prefer URL download if available
+    final_input = url_file_path or input_file
+    if not final_input:
+        raise gr.Error("Please upload a file or paste a valid URL and click Download.")
 
     num_speakers = int(num_speakers_raw) if num_speakers_raw and int(num_speakers_raw) > 0 else None
     min_speakers = int(min_speakers_raw) if min_speakers_raw and int(min_speakers_raw) > 0 else None
     max_speakers = int(max_speakers_raw) if max_speakers_raw and int(max_speakers_raw) > 0 else None
     token = hf_token.strip() if hf_token and hf_token.strip() else None
 
-    # Gather voice profiles from the library (optional)
     voice_profiles = []
     if use_voice_library:
         db = _db()
         for prof in db.get_voice_profiles():
             emb = db.get_voice_profile_embedding(prof["id"])
-            voice_profiles.append({
-                "name": prof["name"],
-                "embedding": emb,
-                "audio_path": prof.get("audio_path"),
-            })
+            voice_profiles.append({"name": prof["name"], "embedding": emb, "audio_path": prof.get("audio_path")})
 
     log_lines: list[str] = []
 
@@ -83,81 +199,65 @@ def process_meeting(
 
     try:
         session_id = run_pipeline(
-            input_path=input_file,
+            input_path=final_input,
             demucs_model=demucs_model,
             skip_demucs=skip_demucs,
             num_speakers=num_speakers,
             min_speakers=min_speakers,
             max_speakers=max_speakers,
             hf_token=token,
-            whisper_model=whisper_model,
             language=language if language != "auto" else None,
             voice_profiles=voice_profiles or None,
             similarity_threshold=similarity_threshold,
             progress_cb=_cb,
         )
-        log_lines.append(f"\nSession ID: {session_id} — Done!")
+        log_lines.append(f"\nSession {session_id} complete.")
         return (
-            f"Processing complete. Session ID: {session_id}",
+            f"Done — Session ID: {session_id}",
             "\n".join(log_lines),
             str(session_id),
         )
-
     except Exception as exc:
         log_lines.append(f"\nERROR: {exc}")
         raise gr.Error(str(exc))
 
 
-# ── Tab 2: Results ────────────────────────────────────────────────────────────
+# ── Tab 2: Results ─────────────────────────────────────────────────────────────
 
-def _load_session_list() -> list[str]:
-    sessions = _db().list_sessions()
-    return [f"[{s['id']}] {s['input_filename']} — {_ts(s['created_at'])} ({s['status']})"
-            for s in sessions]
+def _session_choices() -> list[str]:
+    return [
+        f"[{s['id']}] {s['input_filename']} — {_ts(s['created_at'])} ({s['status']})"
+        for s in _db().list_sessions()
+    ]
 
 
 def load_results(session_choice: str):
     if not session_choice:
         return "", "", []
-
     session_id = int(session_choice.split("]")[0].lstrip("["))
     db = _db()
     transcript = db.rebuild_transcript(session_id)
-
     speakers = db.get_speakers(session_id)
-    speaker_table = [[s["id"], s["original_label"], s["display_name"],
-                      _dur(s["total_duration"])] for s in speakers]
-
+    speaker_table = [[s["id"], s["original_label"], s["display_name"], _dur(s["total_duration"])]
+                     for s in speakers]
     chunks = db.get_chunks(session_id)
-    timeline_lines = [
+    timeline = "\n".join(
         f"[{c['start_time']:07.3f}s - {c['end_time']:07.3f}s]  {c['display_name']}"
         for c in chunks
-    ]
-    timeline = "\n".join(timeline_lines)
-
+    )
     return transcript, timeline, speaker_table
 
 
 def save_speaker_names(session_choice: str, speaker_table):
-    if not session_choice or speaker_table is None:
+    if not session_choice or not speaker_table:
         return "Nothing to save."
-
     session_id = int(session_choice.split("]")[0].lstrip("["))
     db = _db()
-
     for row in speaker_table:
-        spk_id, orig, new_name, _ = row[0], row[1], row[2], row[3]
+        spk_id, _orig, new_name, _dur = row
         if new_name and str(new_name).strip():
             db.update_speaker_name(int(spk_id), str(new_name).strip())
-
-    # Rebuild transcript with new names
-    transcript = db.rebuild_transcript(session_id)
-    return transcript
-
-
-def refresh_sessions_dropdown():
-    choices = _load_session_list()
-    return gr.Dropdown(choices=choices, value=choices[0] if choices else None)
+    return db.rebuild_transcript(session_id)
 
 
 def export_transcript(session_choice: str):
@@ -169,21 +269,16 @@ def export_transcript(session_choice: str):
     if not session or not session.get("output_dir"):
         return None
     txt_path = Path(session["output_dir"]) / "transcript.txt"
-    if txt_path.exists():
-        return str(txt_path)
-    # Fallback: write on the fly
-    text = db.rebuild_transcript(session_id)
     txt_path.parent.mkdir(parents=True, exist_ok=True)
-    txt_path.write_text(text, encoding="utf-8")
+    txt_path.write_text(db.rebuild_transcript(session_id), encoding="utf-8")
     return str(txt_path)
 
 
-# ── Tab 3: Voice Library ──────────────────────────────────────────────────────
+# ── Tab 3: Voice Library ───────────────────────────────────────────────────────
 
 def load_voice_library():
-    profiles = _db().get_voice_profiles()
-    return [[p["id"], p["name"], p.get("audio_path", "—"),
-             _ts(p["created_at"])] for p in profiles]
+    return [[p["id"], p["name"], p.get("audio_path") or "—", _ts(p["created_at"])]
+            for p in _db().get_voice_profiles()]
 
 
 def add_voice_profile(name: str, audio_file):
@@ -191,96 +286,105 @@ def add_voice_profile(name: str, audio_file):
         raise gr.Error("Please enter a speaker name.")
     name = name.strip()
     db = _db()
-
     audio_path = None
     embedding = None
-
     if audio_file:
-        # Copy into voice_samples_dir for permanent storage
         dst = cfg.voice_samples_dir / f"{name.replace(' ', '_')}.wav"
         shutil.copy2(audio_file, dst)
         audio_path = str(dst)
         embedding = compute_embedding(audio_path)
         if embedding is None:
-            raise gr.Error("Could not compute embedding — audio may be too short. Use 5-30s clips.")
-
+            raise gr.Error("Could not compute voice embedding — clip may be too short. Use 5–30s of clear speech.")
     db.upsert_voice_profile(name=name, audio_path=audio_path, embedding=embedding)
-    return f"Saved profile '{name}'.", load_voice_library()
+    return f"Profile '{name}' saved.", load_voice_library()
 
 
 def delete_voice_profile(profile_table, selected_index):
-    if profile_table is None or len(profile_table) == 0:
+    if not profile_table:
         return "Nothing to delete.", load_voice_library()
     try:
-        row = profile_table[selected_index]
-        profile_id = int(row[0])
-        name = row[1]
+        profile_id = int(profile_table[int(selected_index)][0])
+        name = profile_table[int(selected_index)][1]
         _db().delete_voice_profile(profile_id)
         return f"Deleted '{name}'.", load_voice_library()
-    except (IndexError, TypeError):
-        return "Select a row to delete.", load_voice_library()
+    except (IndexError, TypeError, ValueError):
+        return "Select a valid row index.", load_voice_library()
 
 
-# ── Tab 4: History ────────────────────────────────────────────────────────────
+# ── Tab 4: History ─────────────────────────────────────────────────────────────
 
 def load_history():
-    sessions = _db().list_sessions()
-    rows = []
-    for s in sessions:
-        rows.append([
-            s["id"],
-            _ts(s["created_at"]),
-            s["input_filename"],
-            s["status"],
-            s.get("whisper_model", "—"),
-            s.get("language") or "auto",
-            _dur(s.get("elapsed_seconds")),
-        ])
-    return rows
+    return [
+        [s["id"], _ts(s["created_at"]), s["input_filename"], s["status"],
+         s.get("whisper_model") or "—", s.get("language") or "auto",
+         _dur(s.get("elapsed_seconds"))]
+        for s in _db().list_sessions()
+    ]
 
 
 def delete_session_action(history_table, selected_index):
-    if history_table is None or len(history_table) == 0:
+    if not history_table:
         return "Nothing to delete.", load_history()
     try:
-        row = history_table[selected_index]
-        session_id = int(row[0])
+        session_id = int(history_table[int(selected_index)][0])
         _db().delete_session(session_id)
         return f"Deleted session {session_id}.", load_history()
-    except (IndexError, TypeError):
-        return "Select a row to delete.", load_history()
+    except (IndexError, TypeError, ValueError):
+        return "Select a valid row index.", load_history()
 
 
-# ── UI layout ─────────────────────────────────────────────────────────────────
+# ── Gradio UI ──────────────────────────────────────────────────────────────────
 
 def build_ui() -> gr.Blocks:
-    session_choices = _load_session_list()
-
     with gr.Blocks(title="Meeting Transcription", theme=gr.themes.Soft()) as demo:
 
         gr.Markdown(
             "# Meeting Transcription App\n"
-            "**Pipeline:** Video → Demucs denoising → Pyannote diarization "
-            "→ Resemblyzer identification → Whisper transcription"
+            "**Pipeline:** Audio Extraction → Demucs denoising → "
+            "Pyannote diarization → Resemblyzer identification → **Whisper via vLLM**"
         )
 
-        # ── Shared state ──────────────────────────────────────────────────────
         current_session_id = gr.State("")
+        url_file_path      = gr.State(None)   # path of URL-downloaded file
 
         # ════════════════════════════════════════════════════════════════════
         # Tab 1 — Process
         # ════════════════════════════════════════════════════════════════════
         with gr.Tab("Process"):
-
             with gr.Row():
-                with gr.Column(scale=1):
-                    input_file = gr.File(
-                        label="Upload Meeting Video / Audio",
-                        file_types=[".mp4", ".mkv", ".avi", ".mov", ".webm",
-                                    ".wav", ".mp3", ".flac", ".ogg", ".m4a"],
-                        type="filepath",
-                    )
 
+                # ── Left: inputs ──────────────────────────────────────────
+                with gr.Column(scale=1):
+
+                    # ── Input source ──────────────────────────────────────
+                    with gr.Tabs():
+                        with gr.Tab("Upload File"):
+                            input_file = gr.File(
+                                label="Video or Audio File",
+                                file_types=[
+                                    ".mp4", ".mkv", ".avi", ".mov", ".webm",
+                                    ".wav", ".mp3", ".flac", ".ogg", ".m4a",
+                                ],
+                                type="filepath",
+                            )
+
+                        with gr.Tab("From URL"):
+                            gr.Markdown(
+                                "Paste a **direct download link** to a video or audio file. "
+                                "The app will download it before processing."
+                            )
+                            url_input      = gr.Textbox(
+                                label="Download URL",
+                                placeholder="https://example.com/meeting.mp4",
+                            )
+                            download_btn   = gr.Button("Download from URL", variant="secondary")
+                            download_status = gr.Textbox(
+                                label="Download status",
+                                lines=2,
+                                interactive=False,
+                            )
+
+                    # ── Transcription settings ────────────────────────────
                     with gr.Accordion("Transcription", open=True):
                         language = gr.Dropdown(
                             label="Language",
@@ -290,15 +394,14 @@ def build_ui() -> gr.Blocks:
                                      "hu", "ro", "bg", "he", "hi", "id", "vi"],
                             value="auto",
                         )
-                        whisper_model = gr.Dropdown(
-                            label="Whisper Model",
-                            choices=["large-v3", "large-v2", "medium", "small", "base", "tiny"],
-                            value=cfg.default_whisper_model,
+                        gr.Markdown(
+                            f"*Whisper model in use: **{cfg.vllm_model}** served by vLLM at `{cfg.vllm_url}`*"
                         )
 
-                    with gr.Accordion("Denoising", open=False):
+                    # ── Denoising ─────────────────────────────────────────
+                    with gr.Accordion("Denoising (Demucs)", open=False):
                         skip_demucs = gr.Checkbox(
-                            label="Skip Demucs (audio already clean)",
+                            label="Skip Demucs — audio already clean",
                             value=False,
                         )
                         demucs_model = gr.Dropdown(
@@ -307,23 +410,24 @@ def build_ui() -> gr.Blocks:
                             value=cfg.default_demucs_model,
                         )
 
-                    with gr.Accordion("Diarization", open=False):
+                    # ── Diarization ───────────────────────────────────────
+                    with gr.Accordion("Diarization (pyannote)", open=False):
                         hf_token = gr.Textbox(
                             label="Hugging Face Token",
                             placeholder="hf_… (or set HF_TOKEN in .env)",
                             type="password",
                         )
-                        with gr.Row():
-                            num_speakers = gr.Number(label="Exact speakers (0=auto)", value=0, precision=0)
+                        num_speakers = gr.Number(label="Exact speakers (0 = auto)", value=0, precision=0)
                         with gr.Row():
                             min_speakers = gr.Number(label="Min speakers", value=0, precision=0)
                             max_speakers = gr.Number(label="Max speakers", value=0, precision=0)
 
+                    # ── Speaker identification ────────────────────────────
                     with gr.Accordion("Speaker Identification (optional)", open=False):
                         use_voice_library = gr.Checkbox(
-                            label="Use Voice Library for auto-identification",
+                            label="Match against Voice Library",
                             value=False,
-                            info="Manage profiles in the 'Voice Library' tab.",
+                            info="Manage speaker profiles in the 'Voice Library' tab.",
                         )
                         similarity_threshold = gr.Slider(
                             label="Match Threshold",
@@ -334,16 +438,27 @@ def build_ui() -> gr.Blocks:
 
                     run_btn = gr.Button("Process Meeting", variant="primary", size="lg")
 
+                # ── Right: outputs ────────────────────────────────────────
                 with gr.Column(scale=1):
                     process_status = gr.Textbox(label="Status", lines=2, interactive=False)
-                    process_logs = gr.Textbox(label="Logs", lines=20, interactive=False)
+                    process_logs   = gr.Textbox(label="Logs", lines=22, interactive=False)
 
+            # Wire download
+            download_btn.click(
+                fn=download_from_url,
+                inputs=[url_input],
+                outputs=[url_file_path, download_status],
+            )
+
+            # Wire process
             run_btn.click(
                 fn=process_meeting,
                 inputs=[
-                    input_file, language, whisper_model, skip_demucs, demucs_model,
-                    num_speakers, min_speakers, max_speakers,
-                    hf_token, use_voice_library, similarity_threshold,
+                    input_file, url_file_path,
+                    language,
+                    skip_demucs, demucs_model,
+                    hf_token, num_speakers, min_speakers, max_speakers,
+                    use_voice_library, similarity_threshold,
                 ],
                 outputs=[process_status, process_logs, current_session_id],
             )
@@ -353,21 +468,16 @@ def build_ui() -> gr.Blocks:
         # ════════════════════════════════════════════════════════════════════
         with gr.Tab("Results"):
             with gr.Row():
-                session_dd = gr.Dropdown(
-                    label="Select Session",
-                    choices=session_choices,
-                    value=session_choices[0] if session_choices else None,
-                    scale=4,
-                )
-                refresh_btn = gr.Button("Refresh", scale=1)
-                export_btn  = gr.Button("Export Transcript", scale=1)
+                session_dd    = gr.Dropdown(label="Select Session", choices=_session_choices(), scale=4)
+                refresh_btn   = gr.Button("Refresh", scale=1)
+                export_btn    = gr.Button("Export Transcript", scale=1)
 
             export_file = gr.File(label="Download Transcript", visible=False)
 
             with gr.Row():
                 with gr.Column(scale=2):
                     transcript_box = gr.Textbox(
-                        label="Transcript (updates when you save names)",
+                        label="Transcript",
                         lines=28,
                         show_copy_button=True,
                         interactive=False,
@@ -378,10 +488,9 @@ def build_ui() -> gr.Blocks:
                         lines=20,
                         interactive=False,
                     )
-                    gr.Markdown("### Edit Speaker Names")
                     gr.Markdown(
-                        "Double-click a **Display Name** cell to rename a speaker. "
-                        "Click **Save Names** to persist and re-render the transcript."
+                        "### Edit Speaker Names\n"
+                        "Double-click a **Display Name** cell, then click **Save Names**."
                     )
                     speaker_table = gr.Dataframe(
                         headers=["ID", "Original Label", "Display Name", "Duration"],
@@ -399,7 +508,7 @@ def build_ui() -> gr.Blocks:
                 outputs=[transcript_box, timeline_box, speaker_table],
             )
             refresh_btn.click(
-                fn=refresh_sessions_dropdown,
+                fn=lambda: gr.Dropdown(choices=_session_choices()),
                 inputs=[],
                 outputs=[session_dd],
             )
@@ -419,16 +528,16 @@ def build_ui() -> gr.Blocks:
         # ════════════════════════════════════════════════════════════════════
         with gr.Tab("Voice Library"):
             gr.Markdown(
-                "Save named voice samples here. When processing a meeting, enable "
-                "**'Use Voice Library'** in the Process tab to auto-identify speakers."
+                "Save named voice samples here. Enable **'Match against Voice Library'** "
+                "in the Process tab to auto-identify speakers.\n\n"
+                "**Voice samples are optional** — you can always rename speakers manually in Results."
             )
-
             with gr.Row():
                 with gr.Column(scale=1):
                     gr.Markdown("### Add / Update Profile")
-                    new_profile_name  = gr.Textbox(label="Speaker Name", placeholder="e.g. Alice")
-                    new_profile_audio = gr.Audio(
-                        label="Voice Sample (5-30s recommended, optional)",
+                    new_name  = gr.Textbox(label="Speaker Name", placeholder="e.g. Alice")
+                    new_audio = gr.Audio(
+                        label="Voice Sample (5–30s of clear speech, optional)",
                         type="filepath",
                     )
                     add_btn    = gr.Button("Save Profile", variant="primary")
@@ -441,54 +550,46 @@ def build_ui() -> gr.Blocks:
                         datatype=["number", "str", "str", "str"],
                         col_count=(4, "fixed"),
                         interactive=False,
-                        label="Voice Profiles",
                     )
                     with gr.Row():
-                        selected_profile_idx = gr.Number(
-                            label="Row index to delete (0-based)", value=0, precision=0
-                        )
-                        delete_profile_btn = gr.Button("Delete Selected", variant="stop")
-                    delete_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                        del_idx = gr.Number(label="Row index to delete (0-based)", value=0, precision=0)
+                        del_btn = gr.Button("Delete", variant="stop")
+                    del_status = gr.Textbox(label="Status", lines=1, interactive=False)
 
-            # Load profiles on tab open
             demo.load(fn=load_voice_library, inputs=[], outputs=[profile_table])
-
             add_btn.click(
                 fn=add_voice_profile,
-                inputs=[new_profile_name, new_profile_audio],
+                inputs=[new_name, new_audio],
                 outputs=[add_status, profile_table],
             )
-            delete_profile_btn.click(
+            del_btn.click(
                 fn=delete_voice_profile,
-                inputs=[profile_table, selected_profile_idx],
-                outputs=[delete_status, profile_table],
+                inputs=[profile_table, del_idx],
+                outputs=[del_status, profile_table],
             )
 
         # ════════════════════════════════════════════════════════════════════
         # Tab 4 — History
         # ════════════════════════════════════════════════════════════════════
         with gr.Tab("History"):
-            refresh_history_btn = gr.Button("Refresh")
+            refresh_hist_btn = gr.Button("Refresh")
             history_table = gr.Dataframe(
                 headers=["ID", "Date", "File", "Status", "Model", "Language", "Duration"],
                 datatype=["number", "str", "str", "str", "str", "str", "str"],
                 col_count=(7, "fixed"),
                 interactive=False,
-                label="Past Sessions",
             )
             with gr.Row():
-                selected_session_idx = gr.Number(
-                    label="Row index to delete (0-based)", value=0, precision=0
-                )
-                delete_session_btn = gr.Button("Delete Session", variant="stop")
-            history_status = gr.Textbox(label="Status", lines=1, interactive=False)
+                del_sess_idx = gr.Number(label="Row index to delete (0-based)", value=0, precision=0)
+                del_sess_btn = gr.Button("Delete Session", variant="stop")
+            hist_status = gr.Textbox(label="Status", lines=1, interactive=False)
 
             demo.load(fn=load_history, inputs=[], outputs=[history_table])
-            refresh_history_btn.click(fn=load_history, inputs=[], outputs=[history_table])
-            delete_session_btn.click(
+            refresh_hist_btn.click(fn=load_history, inputs=[], outputs=[history_table])
+            del_sess_btn.click(
                 fn=delete_session_action,
-                inputs=[history_table, selected_session_idx],
-                outputs=[history_status, history_table],
+                inputs=[history_table, del_sess_idx],
+                outputs=[hist_status, history_table],
             )
 
     return demo

@@ -1,13 +1,12 @@
-# ── Core ML ──────────────────────────────────────────────────────────────────
-# Install PyTorch FIRST with the correct CUDA version for your system.
-# Example (CUDA 12.1 — adjust as needed):
+# ── PyTorch — install FIRST with the correct CUDA index ──────────────────────
+# CUDA 12.1 (adjust cu121 → cu124 for CUDA 12.4+, or /cpu for no GPU):
 #   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
 #
-# CPU-only fallback (automatically installed if torch is not already present):
+# The lines below are listed for documentation; the setup scripts install them.
 torch>=2.1
 torchaudio>=2.1
 
-# ── Audio I/O ─────────────────────────────────────────────────────────────────
+# ── Audio I/O & resampling ────────────────────────────────────────────────────
 soundfile>=0.12
 resampy>=0.4
 
@@ -17,15 +16,24 @@ demucs>=4.0
 # ── Speaker diarization ───────────────────────────────────────────────────────
 pyannote.audio>=3.1
 
-# ── Transcription ─────────────────────────────────────────────────────────────
-openai-whisper>=20231117
-
 # ── Speaker identification ────────────────────────────────────────────────────
 resemblyzer>=0.1.1
+
+# ── Whisper via vLLM (OpenAI-compatible client) ───────────────────────────────
+openai>=1.30          # client only — vLLM itself is installed separately (see docs/VLLM_SETUP.md)
+
+# ── URL download ──────────────────────────────────────────────────────────────
+requests>=2.31
 
 # ── UI ────────────────────────────────────────────────────────────────────────
 gradio>=4.20
 
+# ── Config ────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0
+
 # ── Utilities ─────────────────────────────────────────────────────────────────
 numpy>=1.24
-python-dotenv>=1.0
+
+# ── vLLM (optional — install in a separate venv to avoid torch conflicts) ─────
+# See docs/VLLM_SETUP.md
+# vllm>=0.5
