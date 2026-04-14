@@ -73,8 +73,8 @@ def load_pyannote() -> Optional[str]:
     import torch
     import diarizer  # noqa: local import after sys.path is set
 
-    token = cfg.hf_token
-    if not token:
+    token1 = cfg.hf_token
+    if not token1:
         return (
             "HF_TOKEN is not set — pyannote cannot be loaded.\n"
             "    Set it in .env: HF_TOKEN=hf_your_token_here"
@@ -85,7 +85,8 @@ def load_pyannote() -> Optional[str]:
 
         pipeline = Pipeline.from_pretrained(
             "pyannote/speaker-diarization-3.1",
-            token=token,
+            token=token1,
+            # use_auth_token = token
         )
 
         device = "cpu"

@@ -47,4 +47,4 @@ exec vllm serve "$MODEL" \
     --dtype "$DTYPE" \
     --max-model-len 448 \
     --gpu-memory-utilization "$GPU_UTIL" \
-    --disable-log-requests
+            

@@ -57,9 +57,11 @@ class Config:
     vllm_api_key: str = field(default_factory=lambda: _env("VLLM_API_KEY", "dummy"))
     # Health endpoint is derived by stripping /v1 from vllm_url
     @property
+    # def vllm_health_url(self) -> str:
+    #     return self.vllm_url.rstrip("/v1").rstrip("/") + "/health"
     def vllm_health_url(self) -> str:
-        return self.vllm_url.rstrip("/v1").rstrip("/") + "/health"
-
+        base = self.vllm_url.removesuffix("/v1").removesuffix("/")
+        return base + "/health"
     # ---------- Gradio ----------
     host: str = field(default_factory=lambda: _env("HOST", "0.0.0.0"))
     port: int = field(default_factory=lambda: _env_int("PORT", 7860))
